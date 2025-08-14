@@ -1,1 +1,1 @@
-Mobility-Aware Adaptive IRS Scheduling for Multi-Node IoT Networks With Energy-Based Spectrum Sensing
+Mobility-Aware Adaptive IRS Scheduling for Multi-Node IoT Networks With Energy Sensing
