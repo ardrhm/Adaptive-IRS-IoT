@@ -1,46 +1,40 @@
 function IRS_IoT()
-    clc; close all;
-    
+
+    clc;
+    close all;
+
     P = init_params();
     G = build_irs_geometry(P);
     S = init_state(P, G);
-    
-    fprintf('Running %d steps of %.1f ms ...\n', P.Nsteps, 1e3*P.dt);
+
+    fprintf('Running %d steps of %.1f ms ...\n', P.Nsteps, 1e3 * P.dt);
     fprintf('IRS Focus Policy: %s\n', P.focusPolicy);
     fprintf('IRS Phase Quantization: %d bits\n', P.IRS.phaseBits);
-    
+
     for t = 1:P.Nsteps
         S = update_kinematics(P, S);
         S = update_channels(P, G, S);
-        
+
         [focus, S] = select_focus_node(P, S, t);
         S.psi = update_irs_phases(P, G, S, focus, P.IRS.controlMode);
-        
+
         S.chan = allocate_channels(P, G, S);
-        
+
         [Hdir, Hcas] = compute_links(P, G, S);
         Htot = Hdir + Hcas;
         [SINR, rxPwr, interfPwr] = compute_sinr(P, S, Htot);
-        
-        S.hist.SINR(:,t)  = SINR;
-        S.hist.rxPwr(:,t) = rxPwr;
-        S.hist.intf(:,t)  = interfPwr;
-        S.hist.BER(:,t)   = qfunc_compat(sqrt(2*SINR));
-        
-        switch lower(P.rateModel)
-            case 'shannon'
-                S.hist.Rate(:,t) = P.BW * log2(1 + SINR);
-                belowThreshold = SINR < P.minSINR_linear;
-                S.hist.Rate(belowThreshold, t) = 0;
-            case 'bpsk-goodput'
-                S.hist.Rate(:,t) = P.BW * max(0, 1 - S.hist.BER(:,t));
-            otherwise
-                error('Unknown rateModel: %s', P.rateModel);
-        end
-        
+
+        S.hist.SINR(:, t)  = SINR;
+        S.hist.rxPwr(:, t) = rxPwr;
+        S.hist.intf(:, t)  = interfPwr;
+
+        S.hist.Rate(:, t) = P.BW * log2(1 + SINR);
+        belowThresh = SINR < P.minSINR_linear;
+        S.hist.Rate(belowThresh, t) = 0;
+
         S = update_performance_metrics(P, S, t);
     end
-    
+
     display_results(P, S);
 end
 
@@ -48,254 +42,234 @@ function P = init_params()
     P.c   = 3e8;
     P.fc  = 3.5e9;
     P.lam = P.c / P.fc;
-    P.L0  = (4*pi/P.lam)^2;
-    
+    P.L0  = (4 * pi / P.lam)^2;
+
     P.BS.pos   = [0; 0; 10];
-    
     P.IRS.pos  = [30; 0; 8];
     P.IRS.NxNy = [8, 8];
     P.IRS.dxdy = 0.5 * [P.lam, P.lam];
     P.IRS.rho  = 0.98;
     P.IRS.controlMode = 'geometric';
     P.IRS.phaseBits = 3;
-    
+
     P.Nnodes = 10;
     P.area.min = [-50; -50; 0];
     P.area.max = [ 50;  50; 3];
     P.vmax     = 3.0;
-    
+
     P.dt     = 5e-3;
     P.Nsteps = 200;
-    
+
     P.alpha  = 2.2;
-    P.BW         = 5e6;
-    P.Nch        = 4;
+    P.BW     = 5e6;
+    P.Nch    = 4;
     P.TxPow_dBm  = 20;
     P.noiseFig_dB = 6;
-    
+
     P.sensing.Nsamples = 128;
     P.sensing.P_fa     = 0.1;
-    
+
     P.focusPolicy = 'adaptive';
-    
-    P.rateModel = 'shannon';
+    P.rateModel  = 'shannon';
     P.minSINR_dB = -10;
     P.minSINR_linear = 10^(P.minSINR_dB/10);
-    
     P.adapt.windowSize = 20;
-    P.adapt.weightExp = 2;
-    
+    P.adapt.weightExp  = 2;
+
+    P.saveFigures = true;
+
     rng(42, 'twister');
 end
 
 function G = build_irs_geometry(P)
-    Nx = P.IRS.NxNy(1); 
+    Nx = P.IRS.NxNy(1);
     Ny = P.IRS.NxNy(2);
-    dx = P.IRS.dxdy(1); 
+    dx = P.IRS.dxdy(1);
     dy = P.IRS.dxdy(2);
-    
     [xg, yg] = meshgrid((0:Nx-1) - (Nx-1)/2, (0:Ny-1) - (Ny-1)/2);
-    R = P.IRS.pos + [dx*xg(:).'; dy*yg(:).'; zeros(1, Nx*Ny)];
-    
+    R = P.IRS.pos + [dx * xg(:).'; dy * yg(:).'; zeros(1, Nx * Ny)];
     G.Relem = R;
-    G.Nelem = size(R,2);
+    G.Nelem = size(R, 2);
 end
 
 function S = init_state(P, G)
     S.pos = rand(3, P.Nnodes) .* (P.area.max - P.area.min) + P.area.min;
-    theta = 2*pi*rand(1,P.Nnodes);
-    speed = P.vmax * rand(1,P.Nnodes);
-    S.vel  = [cos(theta).*speed; sin(theta).*speed; zeros(1,P.Nnodes)];
-    
-    S.psi = zeros(G.Nelem,1);
-    
-    S.h_dir   = (randn(P.Nnodes,1)+1j*randn(P.Nnodes,1))/sqrt(2);
-    S.h1_elem = (randn(G.Nelem,P.Nnodes)+1j*randn(G.Nelem,P.Nnodes))/sqrt(2);
-    S.h2_elem = (randn(G.Nelem,1)+1j*randn(G.Nelem,1))/sqrt(2);
-    
-    S.lastUpd.dir = zeros(P.Nnodes,1);
-    S.lastUpd.h1  = zeros(P.Nnodes,1);
-    
-    S.chan = ones(P.Nnodes,1);
-    
+
+    theta = 2 * pi * rand(1, P.Nnodes);
+    speed = P.vmax * rand(1, P.Nnodes);
+    S.vel = [cos(theta) .* speed; sin(theta) .* speed; zeros(1, P.Nnodes)];
+
+    S.psi = zeros(G.Nelem, 1);
+
+    S.h_dir   = (randn(P.Nnodes, 1) + 1j * randn(P.Nnodes, 1)) / sqrt(2);
+    S.h1_elem = (randn(G.Nelem, P.Nnodes) + 1j * randn(G.Nelem, P.Nnodes)) / sqrt(2);
+    S.h2_elem = (randn(G.Nelem, 1) + 1j * randn(G.Nelem, 1)) / sqrt(2);
+
+    S.lastUpd.dir = zeros(P.Nnodes, 1);
+    S.lastUpd.h1  = zeros(P.Nnodes, 1);
+
+    S.chan = ones(P.Nnodes, 1);
+
     S.hist.SINR  = zeros(P.Nnodes, P.Nsteps);
-    S.hist.BER   = zeros(P.Nnodes, P.Nsteps);
     S.hist.Rate  = zeros(P.Nnodes, P.Nsteps);
     S.hist.rxPwr = zeros(P.Nnodes, P.Nsteps);
     S.hist.intf  = zeros(P.Nnodes, P.Nsteps);
-    
+
     S.avgRate = zeros(P.Nnodes, 1);
     S.focusCount = zeros(P.Nnodes, 1);
     S.priority = ones(P.Nnodes, 1) / P.Nnodes;
-    
-    kB = 1.38064852e-23; 
+
+    kB = 1.38064852e-23;
     T0 = 290;
-    S.noisePow_W = kB*T0*P.BW * 10^(P.noiseFig_dB/10);
-    S.Ptx_W = 10.^((P.TxPow_dBm - 30)/10);
+    S.noisePow_W = kB * T0 * P.BW * 10^(P.noiseFig_dB / 10);
+    S.Ptx_W = 10.^((P.TxPow_dBm - 30) / 10);
 end
 
 function S = update_kinematics(P, S)
     for n = 1:P.Nnodes
-        pos = S.pos(:,n) + P.dt * S.vel(:,n);
+        pos = S.pos(:, n) + P.dt * S.vel(:, n);
         for ax = 1:3
             if pos(ax) < P.area.min(ax)
-                pos(ax) = 2*P.area.min(ax) - pos(ax); 
-                S.vel(ax,n) = -S.vel(ax,n);
+                pos(ax) = 2 * P.area.min(ax) - pos(ax);
+                S.vel(ax, n) = -S.vel(ax, n);
             elseif pos(ax) > P.area.max(ax)
-                pos(ax) = 2*P.area.max(ax) - pos(ax); 
-                S.vel(ax,n) = -S.vel(ax,n);
+                pos(ax) = 2 * P.area.max(ax) - pos(ax);
+                S.vel(ax, n) = -S.vel(ax, n);
             end
         end
-        S.pos(:,n) = pos;
+        S.pos(:, n) = pos;
     end
 end
 
 function S = update_channels(P, G, S)
     for n = 1:P.Nnodes
-        v = S.vel(:,n);
-        
-        fD_max = norm(v)/P.lam;
+        v = S.vel(:, n);
+        fD_max = norm(v) / P.lam;
         Tc = max(1e-3, 0.423 / max(1e-9, fD_max));
-        
+
         S.lastUpd.dir(n) = S.lastUpd.dir(n) + P.dt;
         if S.lastUpd.dir(n) > Tc
-            S.h_dir(n) = (randn + 1j*randn)/sqrt(2);
+            S.h_dir(n) = (randn + 1j * randn) / sqrt(2);
             S.lastUpd.dir(n) = 0;
         end
-        
-        k_dir = unit_vec(P.BS.pos - S.pos(:,n));
-        fD_dir = doppler_freq(S.vel(:,n), k_dir, P.lam);
-        S.h_dir(n) = S.h_dir(n) .* exp(1j*2*pi*fD_dir*P.dt);
-        
+        k_dir = unit_vec(P.BS.pos - S.pos(:, n));
+        fD_dir = doppler_freq(S.vel(:, n), k_dir, P.lam);
+        S.h_dir(n) = S.h_dir(n) .* exp(1j * 2 * pi * fD_dir * P.dt);
+
         S.lastUpd.h1(n) = S.lastUpd.h1(n) + P.dt;
         if S.lastUpd.h1(n) > Tc
-            S.h1_elem(:,n) = (randn(G.Nelem,1)+1j*randn(G.Nelem,1))/sqrt(2);
+            S.h1_elem(:, n) = (randn(G.Nelem, 1) + 1j * randn(G.Nelem, 1)) / sqrt(2);
             S.lastUpd.h1(n) = 0;
         end
-        
-        dvec_e = G.Relem - S.pos(:,n);
-        k_e    = dvec_e ./ vecnorm(dvec_e,2,1);
-        fD_e   = (S.vel(:,n).' * k_e) / P.lam;
-        S.h1_elem(:,n) = S.h1_elem(:,n) .* exp(1j*2*pi*fD_e.'*P.dt);
+        dvec_e = G.Relem - S.pos(:, n);
+        k_e = dvec_e ./ vecnorm(dvec_e, 2, 1);
+        fD_e = (S.vel(:, n).' * k_e) / P.lam;
+        S.h1_elem(:, n) = S.h1_elem(:, n) .* exp(1j * 2 * pi * fD_e.' * P.dt);
     end
 end
 
 function [focus, S] = select_focus_node(P, S, t)
     switch lower(P.focusPolicy)
         case 'roundrobin'
-            focus = 1 + mod(t-1, P.Nnodes);
-            
+            focus = 1 + mod(t - 1, P.Nnodes);
         case 'adaptive'
             if t <= P.adapt.windowSize
-                focus = 1 + mod(t-1, P.Nnodes);
+                focus = 1 + mod(t - 1, P.Nnodes);
             else
                 weights = 1 ./ (S.avgRate + 1e-6);
                 weights = weights .^ P.adapt.weightExp;
                 weights = weights / sum(weights);
-                
-                cumsum_w = cumsum(weights);
+                cdf = cumsum(weights);
                 r = rand();
-                focus = find(cumsum_w >= r, 1, 'first');
+                focus = find(cdf >= r, 1, 'first');
                 if isempty(focus)
                     focus = P.Nnodes;
                 end
             end
-            
         case 'maxmin'
             if t <= P.Nnodes
                 focus = t;
             else
                 [~, focus] = min(S.avgRate);
             end
-            
         otherwise
-            focus = 1 + mod(t-1, P.Nnodes);
+            focus = 1 + mod(t - 1, P.Nnodes);
     end
-    
     S.focusCount(focus) = S.focusCount(focus) + 1;
 end
 
 function psi = update_irs_phases(P, G, S, focusNode, mode)
-    u = S.pos(:,focusNode);
+    u = S.pos(:, focusNode);
     b = P.BS.pos;
-    
     d1 = vecnorm(G.Relem - u, 2, 1);
     d2 = vecnorm(b - G.Relem, 2, 1);
-    
-    phi_geom = -2*pi/P.lam * (d1 + d2);
-    
+    phi_geom = -2 * pi / P.lam * (d1 + d2);
     switch lower(mode)
         case 'geometric'
             psi = wrapToPi(-phi_geom(:));
         case 'perfectcsi'
-            h1 = S.h1_elem(:,focusNode);
+            h1 = S.h1_elem(:, focusNode);
             h2 = S.h2_elem(:);
             psi = wrapToPi(-phi_geom(:) - angle(h1) - angle(h2));
         otherwise
             error('Unknown IRS control mode: %s', mode);
     end
-    
     if P.IRS.phaseBits > 0
-        levels = 2^P.IRS.phaseBits;
-        psi = round(psi * levels / (2*pi)) * 2*pi / levels;
+        levels = 2 ^ P.IRS.phaseBits;
+        psi = round(psi * levels / (2 * pi)) * 2 * pi / levels;
     end
 end
 
 function [Hdir, Hcas] = compute_links(P, G, S)
     N   = P.Nnodes;
     rho = P.IRS.rho;
-    
-    Hdir = zeros(N,1);
-    Hcas = zeros(N,1);
-    
+    Hdir = zeros(N, 1);
+    Hcas = zeros(N, 1);
     for n = 1:N
-        u = S.pos(:,n);
+        u = S.pos(:, n);
         b = P.BS.pos;
-        
         dd = norm(b - u);
         [beta_d, ~] = path_loss_linear(P, dd);
-        Hdir(n) = sqrt(beta_d) * S.h_dir(n) .* exp(-1j*2*pi/P.lam * dd);
-        
+        Hdir(n) = sqrt(beta_d) * S.h_dir(n) .* exp(-1j * 2 * pi / P.lam * dd);
         d1 = vecnorm(G.Relem - u, 2, 1);
         d2 = vecnorm(b - G.Relem, 2, 1);
-        
         [beta12, ~] = path_loss_linear(P, d1, d2);
-        geom_phase = -2*pi/P.lam * (d1 + d2);
-        
-        h1 = S.h1_elem(:,n).';
+        geom_phase = -2 * pi / P.lam * (d1 + d2);
+        h1 = S.h1_elem(:, n).';
         h2 = S.h2_elem(:).';
         psi = S.psi(:).';
-        
-        elem = rho * sqrt(beta12) .* (h1 .* h2) .* exp(1j*(geom_phase + psi));
+        elem = rho * sqrt(beta12) .* (h1 .* h2) .* exp(1j * (geom_phase + psi));
         Hcas(n) = sum(elem, 2);
     end
 end
 
 function [beta, PL] = path_loss_linear(P, d1, d2)
     alpha = P.alpha;
-    
+    d0 = P.lam / (2 * pi);
     if nargin == 2
         d = max(eps, d1);
-        PL = P.L0 * (d.^alpha);
+        PL = P.L0 * d .^ alpha;
+        idx = d <= d0;
+        PL(idx) = 1;
         beta = 1 ./ PL;
     elseif nargin == 3
         d1 = max(eps, d1);
         d2 = max(eps, d2);
-        PL = (P.L0.^2) .* (d1.^alpha) .* (d2.^alpha);
+        PL = (P.L0 .^ 2) .* (d1 .^ alpha) .* (d2 .^ alpha);
+        idx = (d1 .* d2) <= d0 ^ 2;
+        PL(idx) = 1;
         beta = 1 ./ PL;
     else
-        error('path_loss_linear: invalid args');
+        error('path_loss_linear: invalid number of inputs');
     end
 end
 
 function [SINR, rxPwr, interfPwr] = compute_sinr(P, S, Htot)
     N   = P.Nnodes;
     Nch = P.Nch;
-    
-    rxPwr = S.Ptx_W * abs(Htot).^2;
-    interfPwr = zeros(N,1);
+    rxPwr = S.Ptx_W * abs(Htot) .^ 2;
+    interfPwr = zeros(N, 1);
     noise = S.noisePow_W;
-    
     for c = 1:Nch
         idx = find(S.chan == c);
         if isempty(idx), continue; end
@@ -305,7 +279,6 @@ function [SINR, rxPwr, interfPwr] = compute_sinr(P, S, Htot)
             interfPwr(n) = Psum - rxPwr(n);
         end
     end
-    
     SINR = rxPwr ./ (interfPwr + noise + eps);
 end
 
@@ -314,21 +287,16 @@ function chan = allocate_channels(P, G, S)
     N   = P.Nnodes;
     Nwin = P.sensing.Nsamples;
     sigma2 = S.noisePow_W;
-    
-    gamma = energy_threshold_correct(Nwin, sigma2, P.sensing.P_fa);
-    
+    gamma = energy_threshold_correct(Nwin, sigma2, P.sensing.P_fa, true);
     [Hdir, Hcas] = compute_links(P, G, S);
     Htot = Hdir + Hcas;
-    rxPower = S.Ptx_W * abs(Htot).^2;
-    
-    noiseEnergy = max(0, Nwin*sigma2 + sqrt(Nwin)*sigma2*randn(Nch,1));
+    rxPower = S.Ptx_W * abs(Htot) .^ 2;
+    noiseEnergy = sigma2 * chi2rnd(2 * Nwin, Nch, 1) / 2;
     chEnergy = noiseEnergy;
-    
     for c = 1:Nch
         idx = S.chan == c;
         chEnergy(c) = chEnergy(c) + Nwin * sum(rxPower(idx));
     end
-    
     chan = S.chan;
     for n = 1:N
         picked = false;
@@ -349,88 +317,87 @@ function chan = allocate_channels(P, G, S)
 end
 
 function S = update_performance_metrics(P, S, t)
-    if strcmp(P.focusPolicy, 'adaptive') || strcmp(P.focusPolicy, 'maxmin')
+    if strcmpi(P.focusPolicy, 'adaptive') || strcmpi(P.focusPolicy, 'maxmin')
         if t <= P.adapt.windowSize
             S.avgRate = mean(S.hist.Rate(:, 1:t), 2);
         else
-            window_start = max(1, t - P.adapt.windowSize + 1);
-            S.avgRate = mean(S.hist.Rate(:, window_start:t), 2);
+            windowStart = max(1, t - P.adapt.windowSize + 1);
+            S.avgRate = mean(S.hist.Rate(:, windowStart:t), 2);
         end
-        
         S.priority = 1 ./ (S.avgRate + 1e-6);
         S.priority = S.priority / sum(S.priority);
     end
 end
 
-function gamma = energy_threshold_correct(Nsamples, sigma2, P_fa)
-    N = Nsamples;
-    z = norminv_approx(1 - P_fa);
-    gamma = sigma2 * (N + sqrt(N) * z);
+function gamma = energy_threshold_correct(Nsamples, sigma2, P_fa, use_exact)
+    if nargin < 4 || ~use_exact
+        z = norminv_approx(1 - P_fa);
+        gamma = sigma2 * (Nsamples + sqrt(Nsamples) * z);
+    else
+        threshold = chi2inv(1 - P_fa, 2 * Nsamples);
+        gamma = sigma2 * threshold / 2;
+    end
 end
 
 function display_results(P, S)
-    avgSINR_dB = 10*log10(mean(S.hist.SINR,2) + eps);
-    avgRate    = mean(S.hist.Rate,2);
-    
+    avgSINR_dB = 10 * log10(mean(S.hist.SINR, 2) + eps);
+    avgRate = mean(S.hist.Rate, 2);
     fprintf('\n=== Summary over %d steps ===\n', P.Nsteps);
     fprintf('Minimum SINR threshold: %.1f dB\n', P.minSINR_dB);
-    fprintf('IRS phase quantization: %d bits (%d levels)\n', ...
-        P.IRS.phaseBits, 2^P.IRS.phaseBits);
-    
-    for n=1:P.Nnodes
+    fprintf('IRS phase quantization: %d bits (%d levels)\n', P.IRS.phaseBits, 2 ^ P.IRS.phaseBits);
+    for n = 1:P.Nnodes
         fprintf('Node %2d: avg SINR = %+6.2f dB, avg Rate = %.2f Mbps, Focus: %.1f%%\n', ...
-            n, avgSINR_dB(n), 1e-6*avgRate(n), 100*S.focusCount(n)/P.Nsteps);
+            n, avgSINR_dB(n), 1e-6 * avgRate(n), 100 * S.focusCount(n) / P.Nsteps);
     end
-    
     fprintf('\n=== Performance Statistics ===\n');
-    fprintf('Network sum rate: %.2f Mbps\n', 1e-6*sum(avgRate));
-    fprintf('Fairness (min/max rate): %.3f\n', min(avgRate)/max(avgRate));
-    fprintf('Jain''s fairness index: %.3f\n', ...
-        sum(avgRate)^2 / (P.Nnodes * sum(avgRate.^2)));
-    
+    fprintf('Network sum rate: %.2f Mbps\n', 1e-6 * sum(avgRate));
+    fprintf('Fairness (min/max rate): %.3f\n', min(avgRate) / max(avgRate));
+    fprintf('Jain''s fairness index: %.3f\n', sum(avgRate) ^ 2 / (P.Nnodes * sum(avgRate .^ 2)));
     belowThreshold = avgSINR_dB < P.minSINR_dB;
     if any(belowThreshold)
         fprintf('\nNodes frequently below decode threshold (%.1f dB):\n', P.minSINR_dB);
         fprintf('  Nodes: %s\n', num2str(find(belowThreshold)));
     end
-    
-    figure('Name','Average SINR per node'); 
-    subplot(2,1,1);
-    bar(avgSINR_dB); 
+    f1 = figure('Name', 'Average SINR per node');
+    subplot(2, 1, 1);
+    bar(avgSINR_dB);
     hold on;
     yline(P.minSINR_dB, 'r--', 'Min Decode Threshold');
-    grid on; 
-    xlabel('Node'); 
+    grid on;
+    xlabel('Node');
     ylabel('Avg SINR [dB]');
     title(sprintf('Average SINR per node (%s scheduling)', P.focusPolicy));
-    
-    subplot(2,1,2);
-    bar(100*S.focusCount/P.Nsteps);
+    subplot(2, 1, 2);
+    bar(100 * S.focusCount / P.Nsteps);
     grid on;
     xlabel('Node');
     ylabel('IRS Focus Time (%)');
     title('IRS Beam Allocation');
-    
-    figure('Name','Network Performance');
-    subplot(2,1,1);
-    plot((1:P.Nsteps)*P.dt, 1e-6*sum(S.hist.Rate,1), '-'); 
+    if P.saveFigures
+        saveas(f1, 'average_sinr_per_node.png');
+    end
+    f2 = figure('Name', 'Network Performance');
+    subplot(2, 1, 1);
+    plot((1:P.Nsteps) * P.dt, 1e-6 * sum(S.hist.Rate, 1), '-');
     grid on;
-    xlabel('Time [s]'); 
-    ylabel('Sum rate [Mbps]'); 
+    xlabel('Time [s]');
+    ylabel('Sum rate [Mbps]');
     title('Network sum rate over time');
-    
-    subplot(2,1,2);
-    plot((1:P.Nsteps)*P.dt, 1e-6*S.hist.Rate, '-');
+    subplot(2, 1, 2);
+    plot((1:P.Nsteps) * P.dt, 1e-6 * S.hist.Rate, '-');
     grid on;
     xlabel('Time [s]');
     ylabel('Rate [Mbps]');
     title('Individual node rates');
     legend(arrayfun(@(x) sprintf('Node %d', x), 1:P.Nnodes, 'UniformOutput', false), ...
         'Location', 'bestoutside');
+    if P.saveFigures
+        saveas(f2, 'network_performance.png');
+    end
 end
 
 function fD = doppler_freq(v, k_hat, lam)
-    if size(k_hat,2) > 1
+    if size(k_hat, 2) > 1
         fD = (v.' * k_hat) / lam;
     else
         fD = (dot(v, k_hat)) / lam;
@@ -438,18 +405,14 @@ function fD = doppler_freq(v, k_hat, lam)
 end
 
 function z = norminv_approx(p)
-    z = -sqrt(2) * erfcinv(2*p);
-end
-
-function y = qfunc_compat(x)
-    y = 0.5 * erfc(x / sqrt(2));
+    z = -sqrt(2) * erfcinv(2 * p);
 end
 
 function u = unit_vec(v)
-    nv = vecnorm(v,2,1);
+    nv = vecnorm(v, 2, 1);
     u = v ./ max(nv, eps);
 end
 
 function ang = wrapToPi(ang)
-    ang = mod(ang + pi, 2*pi) - pi;
+    ang = mod(ang + pi, 2 * pi) - pi;
 end
